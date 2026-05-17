@@ -1,0 +1,30 @@
+plugins {
+    id 'application'
+}
+
+group = 'research.jpa'
+version = '0.1.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.hibernate.orm:hibernate-core:6.4.4.Final'
+    implementation 'com.h2database:h2:2.2.224'
+    implementation 'org.slf4j:slf4j-simple:2.0.12'
+}
+
+application {
+    mainClass = 'research.jpa.JpaHibernateMemoryStudy'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
