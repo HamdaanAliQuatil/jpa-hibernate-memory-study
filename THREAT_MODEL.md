@@ -2,13 +2,13 @@
 
 ## Scope
 
-This note explains the security meaning of the two findings from the JPA/Hibernate memory study:
+This note explains the security meaning of the findings from the JPA/Hibernate memory study:
 
 1. `detach()` / `clear()` leave a pre-GC recovery window.
 2. Initialized object-graph breadth changes how much remains recoverable before GC.
 3. Persistence-context membership is observable through timing.
 
-The goal is to document realistic attacker value without overstating or dismissing the findings.
+The goal is to document realistic attacker value without overstating the findings.
 
 ## Finding 1: Pre-GC Recovery Window After `detach()` / `clear()`
 
@@ -60,11 +60,9 @@ Typical capability levels:
 
 ### Security significance
 
-Balanced assessment:
-
 - Moderate to high significance in a pod/JVM compromise scenario, because it expands the amount and timing of recoverable in-memory data
 - Low significance as a standalone remote exploit concept
-- Strongly relevant for operational assumptions around heap dumps, diagnostics, and "cleanup" logic
+- Strong relevance for operational assumptions around heap dumps, diagnostics, and cleanup logic
 
 ## Finding 2: Initialized Graph Breadth Changes Recoverable Surface
 
@@ -123,11 +121,9 @@ This finding has the same access prerequisites as the pre-GC recovery-window res
 
 ### Security significance
 
-Balanced assessment:
-
 - Operationally meaningful because it ties memory exposure to application hydration choices
-- Stronger than the single-entity result for real-world data-minimization decisions
-- Still mainly relevant under same-process, pod-compromise, or diagnostic-artifact threat models
+- Stronger than the single-entity result for data-minimization decisions
+- Mainly relevant under same-process, pod-compromise, or diagnostic-artifact threat models
 
 ## Finding 3: Timing Oracle For Persistence-Context Membership
 
@@ -174,11 +170,9 @@ This is an information leak about application behavior and state, not about dire
 
 ### Security significance
 
-Balanced assessment:
-
 - Real side-channel inside the same JVM/process boundary
 - Usually not severe as a standalone bug
-- Potentially useful in attack chaining, workflow profiling, session-isolation testing, and same-process adversarial models
+- Potential relevance in attack chaining, workflow profiling, session-isolation testing, and same-process adversarial models
 
 ## Comparison Of The Findings
 
@@ -195,24 +189,6 @@ The timing finding still matters, but mostly for:
 - in-process adversaries
 - exploit chains
 - application-behavior inference
-
-## Recommended Wording
-
-Good wording:
-
-- "`detach()` / `clear()` are lifecycle operations, not memory sanitization."
-- "Detached objects may remain recoverable until GC actually reclaims them."
-- "Initialized associations can expand how much of the object graph remains recoverable before GC."
-- "Persistence-context membership is locally observable through timing."
-- "These findings are most relevant under same-process, pod-compromise, or diagnostic-artifact threat models."
-
-Avoid:
-
-- calling the first finding "memory wiping bypass"
-- calling initialized lazy loading a security control
-- calling the second finding "data exfiltration" without qualification
-- calling the timing result "data exfiltration" without qualification
-- implying either issue is a strong remote attack on its own
 
 ## Defensive Implications
 

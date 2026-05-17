@@ -82,11 +82,11 @@ Skip the allocation-pressure window probe:
 - Detached objects remain fully usable to any code that still has a reference to them.
 - This harness answers reachability and retention questions inside the managed heap. It does not prove anything about freed-page byte remnants after GC.
 - The graph results show what happened in this setup with Hibernate 6.4 and H2. They should be read as controlled measurements, not universal JVM rules.
-- `live=false` heap dumps are the right next step if you want to ask whether dead objects are still visible in raw heap artifacts.
+- `live=false` heap dumps are a suitable next step for checking whether dead objects remain visible in heap artifacts.
 - HPROF is still a managed-heap artifact, not a raw RAM acquisition tool. It is useful for object reachability and retained content, but not for proving byte remnants in freed pages.
 
 ## Repository hygiene
 
 - This repository is intended to commit source and written findings.
 - Generated artifacts such as `build/`, `.gradle/`, and `.hprof` dumps should stay local and are ignored by git.
-- The root-level notes (`FINDINGS.md` and `THREAT_MODEL.md`) are the shareable research summary for reviewers and mentors.
+- The root-level notes (`FINDINGS.md` and `THREAT_MODEL.md`) summarize the experimental results and threat-model implications.

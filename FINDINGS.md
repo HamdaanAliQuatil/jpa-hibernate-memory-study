@@ -23,7 +23,7 @@ What remains unresolved:
 - Whether dead objects still appear in the raw heap after they are no longer live.
 - Whether the surviving `String` marker after forced GC is due to H2/JDBC retention, string deduplication, or some other non-Hibernate path.
 
-The new `live=false` heap dumps are intended for that next forensic step.
+The new `live=false` heap dumps support that additional forensic step.
 
 Security meaning:
 
@@ -34,7 +34,7 @@ Security meaning:
 
 ### Phase 2 extension: how much of the graph survives across lifecycle boundaries?
 
-The phase 2 graph runs produced the clearest new result of the study.
+The phase 2 graph runs produced the main extension beyond the single-entity baseline.
 
 Controlled scenarios:
 
@@ -57,12 +57,12 @@ What the graph matrix showed:
 - Expanding the initialized graph from one child to three children expanded the amount of recoverable material in the expected way.
 - In this harness, lifecycle boundary changed managed-state bookkeeping, but it did not materially change the pre-GC retention story once the graph had already been initialized.
 
-The strongest practical conclusion from phase 2 is:
+The main phase 2 conclusion is:
 
 - graph breadth mattered more than boundary choice
 - initialization state mattered more than boundary choice
 
-That gives a more production-relevant answer than the phase 1 single-entity study. Real applications usually do not leak risk one entity at a time; they leak whatever they have already hydrated.
+This extends the phase 1 single-entity result to a more typical ORM usage pattern. In many applications, the relevant exposure surface is the portion of the graph that has already been hydrated.
 
 Observed pattern across boundaries:
 
@@ -75,6 +75,13 @@ One important nuance:
 
 - `transaction.commit()` kept managed entries alive while the session stayed open, which is expected session behavior.
 - But from a retention perspective, commit did not produce a meaningfully different outcome from the other boundaries in this controlled setup.
+
+Concrete example:
+
+- Consider a model such as `Order -> Payments -> Cards`.
+- If a request loads only the `Order` and never initializes `Payments` or `Cards`, then the pre-GC recovery window is mostly limited to the `Order` and its already-loaded state.
+- If the same request initializes `Payments`, and then traverses into `Cards`, the recoverable surface can expand to include those associated objects as well.
+- In that sense, the relevant question is often not only "was the root entity detached?" but also "how much of the graph had already been materialized before detachment or session teardown?"
 
 ### 2. Can cache/timing behavior reveal persistence-context membership?
 
@@ -109,7 +116,7 @@ If an adversary already has enough capability to inspect heap state inside the p
 
 ### Graph retention
 
-The phase 2 result sharpens the memory-residency story:
+The phase 2 result refines the memory-residency story:
 
 - the main question is not only whether one detached entity survives
 - it is also how much of the initialized graph survives with it
@@ -152,7 +159,7 @@ The phase 2 report also includes a boundary-by-scenario matrix for:
 - initialized single-child graph
 - initialized multi-child graph
 
-## Next forensic step
+## Future work
 
 Inspect the `*-all.hprof` files in MAT and search for the exact markers:
 
@@ -161,6 +168,6 @@ Inspect the `*-all.hprof` files in MAT and search for the exact markers:
 - `replacementNoteMarker`
 - `replacementPayloadMarker`
 
-That is the next step needed to move from "still live vs not live" to "still visible anywhere in the raw heap dump".
+That step would help distinguish "still live vs not live" from "still visible anywhere in the raw heap dump".
 
 For a more complete threat-model discussion, see [THREAT_MODEL.md](./THREAT_MODEL.md).
