@@ -2,7 +2,7 @@
 
 Date: 2026-05-17
 
-## Controlled answers to the two research questions
+## Controlled answers to the research questions
 
 ### 1. After `clear()` or `detach()`, do entity values or dirty-check snapshots remain in heap long enough to be recovered?
 
@@ -31,6 +31,50 @@ Security meaning:
 - It is not a remote exploit by itself.
 - It matters because teams sometimes over-interpret `clear()` / `detach()` as if they also clean memory. They do not.
 - In a compromised pod or same-JVM-code-execution scenario, this widens the collection window for sensitive entity data.
+
+### Phase 2 extension: how much of the graph survives across lifecycle boundaries?
+
+The phase 2 graph runs produced the clearest new result of the study.
+
+Controlled scenarios:
+
+- a multi-child graph with the lazy collection left uninitialized
+- a single-child graph with the association initialized
+- a multi-child graph with three initialized children
+
+Boundaries tested:
+
+- `detach(entity)`
+- `clear()`
+- `session.close()`
+- `transaction.commit()`
+- `transaction.rollback()`
+
+What the graph matrix showed:
+
+- If the lazy collection was not initialized, the children never entered the retained graph in this harness.
+- Once the association was initialized, the child entities and their payload markers joined the same pre-GC recovery window as the root entity.
+- Expanding the initialized graph from one child to three children expanded the amount of recoverable material in the expected way.
+- In this harness, lifecycle boundary changed managed-state bookkeeping, but it did not materially change the pre-GC retention story once the graph had already been initialized.
+
+The strongest practical conclusion from phase 2 is:
+
+- graph breadth mattered more than boundary choice
+- initialization state mattered more than boundary choice
+
+That gives a more production-relevant answer than the phase 1 single-entity study. Real applications usually do not leak risk one entity at a time; they leak whatever they have already hydrated.
+
+Observed pattern across boundaries:
+
+- After operation: the root and any initialized children were still reachable.
+- After session close: that remained true.
+- After allocation pressure: the root and children were no longer strongly reachable in this run.
+- After forced GC: the same objects remained not strongly reachable.
+
+One important nuance:
+
+- `transaction.commit()` kept managed entries alive while the session stayed open, which is expected session behavior.
+- But from a retention perspective, commit did not produce a meaningfully different outcome from the other boundaries in this controlled setup.
 
 ### 2. Can cache/timing behavior reveal persistence-context membership?
 
@@ -63,6 +107,17 @@ Security meaning:
 
 If an adversary already has enough capability to inspect heap state inside the process, `detach()` and `clear()` are not a cleanup primitive. They only change ORM semantics. The object may remain present until GC actually runs.
 
+### Graph retention
+
+The phase 2 result sharpens the memory-residency story:
+
+- the main question is not only whether one detached entity survives
+- it is also how much of the initialized graph survives with it
+
+In this harness, uninitialized lazy associations did not add recoverable children. Initialized associations did.
+
+That means the security-relevant unit is often not "an entity" but "the portion of the graph the request already touched".
+
 ### Timing oracle
 
 If an adversary can run code in-process, timing can reveal:
@@ -90,6 +145,12 @@ The enhanced run can generate:
   - after session close
   - after allocation pressure
   - after forced GC
+
+The phase 2 report also includes a boundary-by-scenario matrix for:
+
+- uninitialized lazy graph
+- initialized single-child graph
+- initialized multi-child graph
 
 ## Next forensic step
 

@@ -15,8 +15,10 @@ import java.util.UUID;
 
 import javax.management.MBeanServer;
 
+import org.hibernate.Hibernate;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
+import org.hibernate.Transaction;
 import org.hibernate.boot.MetadataSources;
 import org.hibernate.boot.registry.StandardServiceRegistry;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
@@ -42,13 +44,33 @@ public final class JpaHibernateMemoryStudy {
         Files.createDirectories(outputDir);
 
         try (SessionFactory sessionFactory = buildSessionFactory()) {
-            Long entityId = seed(sessionFactory);
+            SeedData seedData = seed(sessionFactory);
 
-            RetentionResult detachResult = runRetentionExperiment(sessionFactory, entityId, false, options, outputDir);
-            RetentionResult clearResult = runRetentionExperiment(sessionFactory, entityId, true, options, outputDir);
-            TimingResult timingResult = runTimingExperiment(sessionFactory, entityId);
+            NoteRetentionResult detachBaseline = runNoteRetentionExperiment(
+                sessionFactory,
+                seedData.noteId(),
+                NoteBoundary.DETACH,
+                options,
+                outputDir
+            );
+            NoteRetentionResult clearBaseline = runNoteRetentionExperiment(
+                sessionFactory,
+                seedData.noteId(),
+                NoteBoundary.CLEAR,
+                options,
+                outputDir
+            );
 
-            String report = buildReport(detachResult, clearResult, timingResult, options);
+            List<GraphRetentionResult> graphResults = new ArrayList<>();
+            for (GraphScenario scenario : GraphScenario.values()) {
+                for (GraphBoundary boundary : GraphBoundary.values()) {
+                    graphResults.add(runGraphRetentionExperiment(sessionFactory, seedData, scenario, boundary, options, outputDir));
+                }
+            }
+
+            TimingResult timingResult = runTimingExperiment(sessionFactory, seedData.noteId());
+
+            String report = buildReport(detachBaseline, clearBaseline, graphResults, timingResult, options);
             Path reportPath = outputDir.resolve("findings.md");
             Files.writeString(reportPath, report, StandardCharsets.UTF_8);
 
@@ -79,65 +101,92 @@ public final class JpaHibernateMemoryStudy {
 
         return new MetadataSources(registry)
             .addAnnotatedClass(SecretNote.class)
+            .addAnnotatedClass(GraphRoot.class)
+            .addAnnotatedClass(GraphChild.class)
             .buildMetadata()
             .buildSessionFactory();
     }
 
-    private static Long seed(SessionFactory sessionFactory) {
+    private static SeedData seed(SessionFactory sessionFactory) {
         try (Session session = sessionFactory.openSession()) {
             session.beginTransaction();
+
             SecretNote note = new SecretNote(
                 "owner-" + UUID.randomUUID(),
                 markerString("db-note"),
                 secretBytes(markerString("db-secret"))
             );
             session.persist(note);
+
+            GraphRoot singleRoot = new GraphRoot(
+                markerString("single-root-title"),
+                secretBytes(markerString("single-root-payload"))
+            );
+            singleRoot.addChild(new GraphChild(
+                markerString("single-child-name"),
+                secretBytes(markerString("single-child-payload"))
+            ));
+            session.persist(singleRoot);
+
+            GraphRoot multiRoot = new GraphRoot(
+                markerString("multi-root-title"),
+                secretBytes(markerString("multi-root-payload"))
+            );
+            multiRoot.addChild(new GraphChild(
+                markerString("multi-child-a-name"),
+                secretBytes(markerString("multi-child-a-payload"))
+            ));
+            multiRoot.addChild(new GraphChild(
+                markerString("multi-child-b-name"),
+                secretBytes(markerString("multi-child-b-payload"))
+            ));
+            multiRoot.addChild(new GraphChild(
+                markerString("multi-child-c-name"),
+                secretBytes(markerString("multi-child-c-payload"))
+            ));
+            session.persist(multiRoot);
+
             session.getTransaction().commit();
-            return note.getId();
+            return new SeedData(note.getId(), singleRoot.getId(), multiRoot.getId());
         }
     }
 
-    private static RetentionResult runRetentionExperiment(
+    private static NoteRetentionResult runNoteRetentionExperiment(
         SessionFactory sessionFactory,
         Long entityId,
-        boolean useClear,
+        NoteBoundary boundary,
         StudyOptions options,
         Path outputDir
     ) throws Exception {
-        RetentionProbe probe = createRetentionProbe(sessionFactory, entityId, useClear, options, outputDir);
-
-        ReachabilityState afterSessionClose = snapshotReachability(probe);
-
-        PressureObservation pressureObservation = options.windowProbe()
-            ? runAllocationPressureWindow(probe)
-            : PressureObservation.notRun();
+        NoteRetentionProbe probe = createNoteRetentionProbe(sessionFactory, entityId, boundary, options, outputDir);
+        NoteReachabilityState afterSessionClose = snapshotNoteReachability(probe);
+        NotePressureObservation pressureObservation = options.windowProbe()
+            ? runNoteAllocationPressureWindow(probe)
+            : NotePressureObservation.notRun();
 
         forceGc();
 
         if (options.heapDumps()) {
-            dumpHeap(outputDir.resolve(probe.mode() + "-after-gc-live.hprof"), true);
+            dumpHeap(outputDir.resolve(boundary.filePrefix() + "-after-gc-live.hprof"), true);
         }
         if (options.nonLiveHeapDumps()) {
-            dumpHeap(outputDir.resolve(probe.mode() + "-after-gc-all.hprof"), false);
+            dumpHeap(outputDir.resolve(boundary.filePrefix() + "-after-gc-all.hprof"), false);
         }
 
-        ReachabilityState afterForcedGc = snapshotReachability(probe);
-
+        NoteReachabilityState afterForcedGc = snapshotNoteReachability(probe);
         return probe.toResult(afterSessionClose, pressureObservation, afterForcedGc);
     }
 
-    private static RetentionProbe createRetentionProbe(
+    private static NoteRetentionProbe createNoteRetentionProbe(
         SessionFactory sessionFactory,
         Long entityId,
-        boolean useClear,
+        NoteBoundary boundary,
         StudyOptions options,
         Path outputDir
     ) throws Exception {
-        String mode = useClear ? "clear" : "detach";
-        String replacementMarker = markerString("sanitized-note");
-        String originalNoteMarker;
-        String originalPayloadMarker;
-        String replacementPayloadMarker = markerString("replacement-payload");
+        String mode = boundary.filePrefix();
+        String replacementNoteMarker = markerString(mode + "-replacement-note");
+        String replacementPayloadMarker = markerString(mode + "-replacement-payload");
 
         WeakReference<SecretNote> entityRef;
         WeakReference<Object[]> loadedStateRef;
@@ -148,10 +197,13 @@ public final class JpaHibernateMemoryStudy {
         int managedEntriesAfter;
         int payloadIndex;
         int noteIndex;
-        ReachabilityState afterOperation;
+        NoteReachabilityState afterOperation;
+        String originalNoteMarker;
+        String originalPayloadMarker;
 
-        try (Session session = sessionFactory.openSession()) {
-            session.beginTransaction();
+        Session session = sessionFactory.openSession();
+        Transaction tx = session.beginTransaction();
+        try {
             SecretNote entity = session.find(SecretNote.class, entityId);
             SessionImplementor sessionImplementor = session.unwrap(SessionImplementor.class);
             PersistenceContext persistenceContext = sessionImplementor.getPersistenceContextInternal();
@@ -169,7 +221,7 @@ public final class JpaHibernateMemoryStudy {
 
             managedEntriesBefore = persistenceContext.getNumberOfManagedEntities();
 
-            entity.setNote(replacementMarker);
+            entity.setNote(replacementNoteMarker);
             entity.setPayload(secretBytes(replacementPayloadMarker));
 
             entityRef = new WeakReference<>(entity);
@@ -184,14 +236,14 @@ public final class JpaHibernateMemoryStudy {
                 dumpHeap(outputDir.resolve(mode + "-before-all.hprof"), false);
             }
 
-            if (useClear) {
+            if (boundary == NoteBoundary.CLEAR) {
                 session.clear();
             } else {
                 session.detach(entity);
             }
 
             managedEntriesAfter = persistenceContext.getNumberOfManagedEntities();
-            afterOperation = snapshotReachability(entityRef, loadedStateRef, oldNoteRef, oldPayloadRef);
+            afterOperation = snapshotNoteReachability(entityRef, loadedStateRef, oldNoteRef, oldPayloadRef);
 
             if (options.heapDumps()) {
                 dumpHeap(outputDir.resolve(mode + "-after-op-live.hprof"), true);
@@ -200,7 +252,7 @@ public final class JpaHibernateMemoryStudy {
                 dumpHeap(outputDir.resolve(mode + "-after-op-all.hprof"), false);
             }
 
-            session.getTransaction().rollback();
+            tx.rollback();
 
             entity = null;
             loadedState = null;
@@ -209,17 +261,21 @@ public final class JpaHibernateMemoryStudy {
             entityEntry = null;
             persistenceContext = null;
             sessionImplementor = null;
+        } finally {
+            if (session.isOpen()) {
+                session.close();
+            }
         }
 
-        return new RetentionProbe(
-            mode,
+        return new NoteRetentionProbe(
+            boundary,
             managedEntriesBefore,
             managedEntriesAfter,
             noteIndex,
             payloadIndex,
             originalNoteMarker,
             originalPayloadMarker,
-            replacementMarker,
+            replacementNoteMarker,
             replacementPayloadMarker,
             afterOperation,
             entityRef,
@@ -229,10 +285,10 @@ public final class JpaHibernateMemoryStudy {
         );
     }
 
-    private static PressureObservation runAllocationPressureWindow(RetentionProbe probe) {
+    private static NotePressureObservation runNoteAllocationPressureWindow(NoteRetentionProbe probe) {
         long start = System.nanoTime();
         List<byte[]> pressure = new ArrayList<>();
-        ReachabilityState lastState = snapshotReachability(probe);
+        NoteReachabilityState lastState = snapshotNoteReachability(probe);
         int steps = 0;
 
         while (steps < PRESSURE_MAX_STEPS) {
@@ -242,13 +298,208 @@ public final class JpaHibernateMemoryStudy {
 
             pressure.add(new byte[PRESSURE_STEP_BYTES]);
             steps++;
-            lastState = snapshotReachability(probe);
+            lastState = snapshotNoteReachability(probe);
         }
 
         long elapsedNanos = System.nanoTime() - start;
         pressure.clear();
 
-        return new PressureObservation(
+        return new NotePressureObservation(
+            true,
+            steps,
+            PRESSURE_STEP_BYTES * steps,
+            elapsedNanos / 1_000_000.0,
+            lastState
+        );
+    }
+
+    private static GraphRetentionResult runGraphRetentionExperiment(
+        SessionFactory sessionFactory,
+        SeedData seedData,
+        GraphScenario scenario,
+        GraphBoundary boundary,
+        StudyOptions options,
+        Path outputDir
+    ) throws Exception {
+        GraphRetentionProbe probe = createGraphRetentionProbe(sessionFactory, seedData, scenario, boundary, options, outputDir);
+        GraphReachabilityState afterSessionClose = snapshotGraphReachability(probe);
+        GraphPressureObservation pressureObservation = options.windowProbe()
+            ? runGraphAllocationPressureWindow(probe)
+            : GraphPressureObservation.notRun();
+
+        forceGc();
+
+        if (options.heapDumps()) {
+            dumpHeap(outputDir.resolve(probe.filePrefix() + "-after-gc-live.hprof"), true);
+        }
+        if (options.nonLiveHeapDumps()) {
+            dumpHeap(outputDir.resolve(probe.filePrefix() + "-after-gc-all.hprof"), false);
+        }
+
+        GraphReachabilityState afterForcedGc = snapshotGraphReachability(probe);
+        return probe.toResult(afterSessionClose, pressureObservation, afterForcedGc);
+    }
+
+    private static GraphRetentionProbe createGraphRetentionProbe(
+        SessionFactory sessionFactory,
+        SeedData seedData,
+        GraphScenario scenario,
+        GraphBoundary boundary,
+        StudyOptions options,
+        Path outputDir
+    ) throws Exception {
+        String filePrefix = scenario.fileSlug + "-" + boundary.fileSlug;
+        WeakReference<GraphRoot> rootRef;
+        WeakReference<Object[]> rootLoadedStateRef;
+        WeakReference<byte[]> originalRootPayloadRef;
+        WeakReference<Object> childrenCollectionRef;
+        List<WeakReference<GraphChild>> childEntityRefs = new ArrayList<>();
+        List<WeakReference<Object[]>> childLoadedStateRefs = new ArrayList<>();
+        List<WeakReference<byte[]>> originalChildPayloadRefs = new ArrayList<>();
+
+        int rootPayloadIndex;
+        int childPayloadIndex = -1;
+        int managedEntriesBefore;
+        int managedEntriesAfter;
+        int initializedChildCount = 0;
+        String rootOriginalPayloadMarker;
+        List<String> childOriginalPayloadMarkers = new ArrayList<>();
+        GraphReachabilityState afterOperation;
+
+        Session session = sessionFactory.openSession();
+        Transaction tx = session.beginTransaction();
+        try {
+            Long rootId = scenario == GraphScenario.GRAPH_INITIALIZED_SINGLE
+                ? seedData.singleGraphRootId()
+                : seedData.multiGraphRootId();
+
+            GraphRoot root = session.find(GraphRoot.class, rootId);
+            SessionImplementor sessionImplementor = session.unwrap(SessionImplementor.class);
+            PersistenceContext persistenceContext = sessionImplementor.getPersistenceContextInternal();
+            EntityEntry rootEntry = persistenceContext.getEntry(root);
+            Object[] rootLoadedState = rootEntry.getLoadedState();
+            String[] rootProperties = rootEntry.getPersister().getPropertyNames();
+            rootPayloadIndex = indexOf(rootProperties, "payload");
+            byte[] originalRootPayload = (byte[]) rootLoadedState[rootPayloadIndex];
+            rootOriginalPayloadMarker = extractMarker(originalRootPayload);
+
+            rootRef = new WeakReference<>(root);
+            rootLoadedStateRef = new WeakReference<>(rootLoadedState);
+            originalRootPayloadRef = new WeakReference<>(originalRootPayload);
+            childrenCollectionRef = new WeakReference<>(root.getChildren());
+            managedEntriesBefore = persistenceContext.getNumberOfManagedEntities();
+
+            root.setTitle(markerString(filePrefix + "-root-title"));
+            root.setPayload(secretBytes(markerString(filePrefix + "-root-replacement-payload")));
+
+            if (scenario.initializesChildren()) {
+                Hibernate.initialize(root.getChildren());
+                initializedChildCount = root.getChildren().size();
+
+                for (int i = 0; i < root.getChildren().size(); i++) {
+                    GraphChild child = root.getChildren().get(i);
+                    EntityEntry childEntry = persistenceContext.getEntry(child);
+                    Object[] childLoadedState = childEntry.getLoadedState();
+                    String[] childProperties = childEntry.getPersister().getPropertyNames();
+                    if (childPayloadIndex == -1) {
+                        childPayloadIndex = indexOf(childProperties, "payload");
+                    }
+                    byte[] originalChildPayload = (byte[]) childLoadedState[childPayloadIndex];
+                    childOriginalPayloadMarkers.add(extractMarker(originalChildPayload));
+
+                    childEntityRefs.add(new WeakReference<>(child));
+                    childLoadedStateRefs.add(new WeakReference<>(childLoadedState));
+                    originalChildPayloadRefs.add(new WeakReference<>(originalChildPayload));
+
+                    child.setName(markerString(filePrefix + "-child-" + i + "-name"));
+                    child.setPayload(secretBytes(markerString(filePrefix + "-child-" + i + "-replacement-payload")));
+                }
+            }
+
+            if (options.heapDumps()) {
+                dumpHeap(outputDir.resolve(filePrefix + "-before-live.hprof"), true);
+            }
+            if (options.nonLiveHeapDumps()) {
+                dumpHeap(outputDir.resolve(filePrefix + "-before-all.hprof"), false);
+            }
+
+            switch (boundary) {
+                case DETACH -> session.detach(root);
+                case CLEAR -> session.clear();
+                case COMMIT -> tx.commit();
+                case ROLLBACK -> tx.rollback();
+                case CLOSE -> session.close();
+            }
+
+            managedEntriesAfter = session.isOpen() ? persistenceContext.getNumberOfManagedEntities() : 0;
+            afterOperation = snapshotGraphReachability(
+                rootRef,
+                rootLoadedStateRef,
+                originalRootPayloadRef,
+                childrenCollectionRef,
+                childEntityRefs,
+                childLoadedStateRefs,
+                originalChildPayloadRefs
+            );
+
+            if (options.heapDumps()) {
+                dumpHeap(outputDir.resolve(filePrefix + "-after-op-live.hprof"), true);
+            }
+            if (options.nonLiveHeapDumps()) {
+                dumpHeap(outputDir.resolve(filePrefix + "-after-op-all.hprof"), false);
+            }
+
+            if (boundary == GraphBoundary.DETACH || boundary == GraphBoundary.CLEAR) {
+                tx.rollback();
+            }
+        } finally {
+            if (session.isOpen()) {
+                session.close();
+            }
+        }
+
+        return new GraphRetentionProbe(
+            scenario,
+            boundary,
+            filePrefix,
+            managedEntriesBefore,
+            managedEntriesAfter,
+            initializedChildCount,
+            rootPayloadIndex,
+            childPayloadIndex,
+            rootOriginalPayloadMarker,
+            childOriginalPayloadMarkers,
+            afterOperation,
+            rootRef,
+            rootLoadedStateRef,
+            originalRootPayloadRef,
+            childrenCollectionRef,
+            childEntityRefs,
+            childLoadedStateRefs,
+            originalChildPayloadRefs
+        );
+    }
+
+    private static GraphPressureObservation runGraphAllocationPressureWindow(GraphRetentionProbe probe) {
+        long start = System.nanoTime();
+        List<byte[]> pressure = new ArrayList<>();
+        GraphReachabilityState lastState = snapshotGraphReachability(probe);
+        int steps = 0;
+
+        while (steps < PRESSURE_MAX_STEPS) {
+            if (!lastState.anyAlive()) {
+                break;
+            }
+
+            pressure.add(new byte[PRESSURE_STEP_BYTES]);
+            steps++;
+            lastState = snapshotGraphReachability(probe);
+        }
+
+        long elapsedNanos = System.nanoTime() - start;
+        pressure.clear();
+
+        return new GraphPressureObservation(
             true,
             steps,
             PRESSURE_STEP_BYTES * steps,
@@ -268,9 +519,9 @@ public final class JpaHibernateMemoryStudy {
             }
         }
 
-        ScenarioMeasurement managedHit = measureScenario(sessionFactory, statistics, entityId, Scenario.MANAGED_HIT);
-        ScenarioMeasurement detachMiss = measureScenario(sessionFactory, statistics, entityId, Scenario.DETACH_THEN_FIND);
-        ScenarioMeasurement clearMiss = measureScenario(sessionFactory, statistics, entityId, Scenario.CLEAR_THEN_FIND);
+        ScenarioMeasurement managedHit = measureScenario(sessionFactory, statistics, entityId, TimingScenario.MANAGED_HIT);
+        ScenarioMeasurement detachMiss = measureScenario(sessionFactory, statistics, entityId, TimingScenario.DETACH_THEN_FIND);
+        ScenarioMeasurement clearMiss = measureScenario(sessionFactory, statistics, entityId, TimingScenario.CLEAR_THEN_FIND);
 
         return new TimingResult(managedHit, detachMiss, clearMiss);
     }
@@ -279,21 +530,21 @@ public final class JpaHibernateMemoryStudy {
         SessionFactory sessionFactory,
         Statistics statistics,
         Long entityId,
-        Scenario scenario
+        TimingScenario scenario
     ) {
         statistics.clear();
         List<Long> samples = new ArrayList<>(TIMING_ITERATIONS);
 
         try (Session session = sessionFactory.openSession()) {
-            if (scenario == Scenario.MANAGED_HIT) {
+            if (scenario == TimingScenario.MANAGED_HIT) {
                 session.find(SecretNote.class, entityId);
             }
 
             for (int i = 0; i < TIMING_ITERATIONS; i++) {
-                if (scenario == Scenario.DETACH_THEN_FIND) {
+                if (scenario == TimingScenario.DETACH_THEN_FIND) {
                     SecretNote entity = session.find(SecretNote.class, entityId);
                     session.detach(entity);
-                } else if (scenario == Scenario.CLEAR_THEN_FIND) {
+                } else if (scenario == TimingScenario.CLEAR_THEN_FIND) {
                     session.clear();
                 }
 
@@ -315,8 +566,9 @@ public final class JpaHibernateMemoryStudy {
     }
 
     private static String buildReport(
-        RetentionResult detachResult,
-        RetentionResult clearResult,
+        NoteRetentionResult detachBaseline,
+        NoteRetentionResult clearBaseline,
+        List<GraphRetentionResult> graphResults,
         TimingResult timingResult,
         StudyOptions options
     ) {
@@ -325,15 +577,32 @@ public final class JpaHibernateMemoryStudy {
         builder.append("Generated: ").append(Instant.now()).append("\n\n");
 
         builder.append("## Scope\n\n");
-        builder.append("- Retention question: after `detach()` or `clear()`, do Hibernate dirty-check snapshots or entity values remain reachable long enough to be recovered?\n");
+        builder.append("- Baseline retention question: after `detach()` or `clear()`, do Hibernate dirty-check snapshots or entity values remain reachable long enough to be recovered?\n");
+        builder.append("- Phase 2 question: how much of an object graph remains reachable across `detach()`, `clear()`, `close()`, `commit()`, and `rollback()`?\n");
         builder.append("- Timing question: does first-level-cache membership create measurable latency differences?\n");
         builder.append("- Heap dump mode: live=").append(options.heapDumps()).append(", nonLive=").append(options.nonLiveHeapDumps()).append(", windowProbe=").append(options.windowProbe()).append("\n\n");
 
-        builder.append("## Retention Results\n\n");
-        appendRetention(builder, detachResult);
-        appendRetention(builder, clearResult);
+        builder.append("## Baseline Retention Results\n\n");
+        appendNoteRetention(builder, detachBaseline);
+        appendNoteRetention(builder, clearBaseline);
 
-        builder.append("## Timing Results\n\n");
+        builder.append("## Phase 2: Object Graph Retention Across Lifecycle Boundaries\n\n");
+        builder.append("| Scenario | Boundary | Init children | managed before | managed after | after operation | after session close | after pressure | after forced GC |\n");
+        builder.append("| --- | --- | ---: | ---: | ---: | --- | --- | --- | --- |\n");
+        for (GraphRetentionResult result : graphResults) {
+            builder.append("| ")
+                .append(result.scenario().label).append(" | ")
+                .append(result.boundary().label).append(" | ")
+                .append(result.initializedChildCount()).append(" | ")
+                .append(result.managedEntriesBefore()).append(" | ")
+                .append(result.managedEntriesAfter()).append(" | ")
+                .append(result.afterOperation().summary()).append(" | ")
+                .append(result.afterSessionClose().summary()).append(" | ")
+                .append(result.pressureObservation().finalState().summary()).append(" | ")
+                .append(result.afterForcedGc().summary()).append(" |\n");
+        }
+
+        builder.append("\n## Timing Results\n\n");
         builder.append("| Scenario | avg us | p50 us | p95 us | prepared statements | entity loads |\n");
         builder.append("| --- | ---: | ---: | ---: | ---: | ---: |\n");
         for (ScenarioMeasurement measurement : List.of(
@@ -351,16 +620,15 @@ public final class JpaHibernateMemoryStudy {
         }
 
         builder.append("\n## Initial Interpretation\n\n");
-        builder.append("- `detach()` and `clear()` do not erase objects. They sever Hibernate's management references. If application references are still held, the object stays alive.\n");
-        builder.append("- `afterOperation` and `afterSessionClose` show the pre-GC recovery window. Objects can remain recoverable until the JVM actually collects them.\n");
-        builder.append("- `afterForcedGc` answers the narrower question of strong reachability after Hibernate release plus explicit garbage collection.\n");
-        builder.append("- `managed-hit` versus detached/cleared timing is a concrete membership oracle inside the same JVM and persistence-context boundary.\n");
-        builder.append("- `live=false` heap dumps add a forensic path for checking whether marker strings or payloads still appear in the raw heap, even when they are no longer live.\n");
+        builder.append("- `detach()` and `clear()` are still lifecycle changes, not cleanup primitives.\n");
+        builder.append("- The graph matrix answers the stronger question: whether traversing more of the object graph increases what remains recoverable before GC.\n");
+        builder.append("- `close()`, `commit()`, and `rollback()` are now directly comparable against `detach()` and `clear()` within the same harness.\n");
+        builder.append("- `managed-hit` versus detached/cleared timing remains a concrete membership oracle inside the same JVM and persistence-context boundary.\n");
         return builder.toString();
     }
 
-    private static void appendRetention(StringBuilder builder, RetentionResult result) {
-        builder.append("### `").append(result.mode()).append("`\n\n");
+    private static void appendNoteRetention(StringBuilder builder, NoteRetentionResult result) {
+        builder.append("### `").append(result.boundary().label).append("`\n\n");
         builder.append("| Field | Value |\n");
         builder.append("| --- | --- |\n");
         builder.append("| managedEntriesBefore | ").append(result.managedEntriesBefore()).append(" |\n");
@@ -371,26 +639,26 @@ public final class JpaHibernateMemoryStudy {
         builder.append("| replacementPayloadMarker | ").append(result.replacementPayloadMarker()).append(" |\n");
         builder.append("| noteIndex | ").append(result.noteIndex()).append(" |\n");
         builder.append("| payloadIndex | ").append(result.payloadIndex()).append(" |\n");
-        appendReachability(builder, "afterOperation", result.afterOperation());
-        appendReachability(builder, "afterSessionClose", result.afterSessionClose());
+        appendNoteReachability(builder, "afterOperation", result.afterOperation());
+        appendNoteReachability(builder, "afterSessionClose", result.afterSessionClose());
         builder.append("| pressureProbeRan | ").append(result.pressureObservation().ran()).append(" |\n");
         builder.append("| pressureSteps | ").append(result.pressureObservation().steps()).append(" |\n");
         builder.append("| pressureBytesAllocated | ").append(result.pressureObservation().bytesAllocated()).append(" |\n");
         builder.append("| pressureElapsedMs | ").append(format(result.pressureObservation().elapsedMillis())).append(" |\n");
-        appendReachability(builder, "afterPressure", result.pressureObservation().finalState());
-        appendReachability(builder, "afterForcedGc", result.afterForcedGc());
+        appendNoteReachability(builder, "afterPressure", result.pressureObservation().finalState());
+        appendNoteReachability(builder, "afterForcedGc", result.afterForcedGc());
         builder.append("\n");
     }
 
-    private static void appendReachability(StringBuilder builder, String label, ReachabilityState state) {
+    private static void appendNoteReachability(StringBuilder builder, String label, NoteReachabilityState state) {
         builder.append("| ").append(label).append(".entityAlive | ").append(state.entityAlive()).append(" |\n");
         builder.append("| ").append(label).append(".loadedStateAlive | ").append(state.loadedStateAlive()).append(" |\n");
         builder.append("| ").append(label).append(".oldNoteAlive | ").append(state.oldNoteAlive()).append(" |\n");
         builder.append("| ").append(label).append(".oldPayloadAlive | ").append(state.oldPayloadAlive()).append(" |\n");
     }
 
-    private static ReachabilityState snapshotReachability(RetentionProbe probe) {
-        return snapshotReachability(
+    private static NoteReachabilityState snapshotNoteReachability(NoteRetentionProbe probe) {
+        return snapshotNoteReachability(
             probe.entityRef(),
             probe.loadedStateRef(),
             probe.oldNoteRef(),
@@ -398,18 +666,63 @@ public final class JpaHibernateMemoryStudy {
         );
     }
 
-    private static ReachabilityState snapshotReachability(
+    private static NoteReachabilityState snapshotNoteReachability(
         WeakReference<SecretNote> entityRef,
         WeakReference<Object[]> loadedStateRef,
         WeakReference<String> oldNoteRef,
         WeakReference<byte[]> oldPayloadRef
     ) {
-        return new ReachabilityState(
+        return new NoteReachabilityState(
             entityRef.get() != null,
             loadedStateRef.get() != null,
             oldNoteRef.get() != null,
             oldPayloadRef.get() != null
         );
+    }
+
+    private static GraphReachabilityState snapshotGraphReachability(GraphRetentionProbe probe) {
+        return snapshotGraphReachability(
+            probe.rootRef(),
+            probe.rootLoadedStateRef(),
+            probe.originalRootPayloadRef(),
+            probe.childrenCollectionRef(),
+            probe.childEntityRefs(),
+            probe.childLoadedStateRefs(),
+            probe.originalChildPayloadRefs()
+        );
+    }
+
+    private static GraphReachabilityState snapshotGraphReachability(
+        WeakReference<GraphRoot> rootRef,
+        WeakReference<Object[]> rootLoadedStateRef,
+        WeakReference<byte[]> originalRootPayloadRef,
+        WeakReference<Object> childrenCollectionRef,
+        List<WeakReference<GraphChild>> childEntityRefs,
+        List<WeakReference<Object[]>> childLoadedStateRefs,
+        List<WeakReference<byte[]>> originalChildPayloadRefs
+    ) {
+        return new GraphReachabilityState(
+            rootRef.get() != null,
+            rootLoadedStateRef.get() != null,
+            originalRootPayloadRef.get() != null,
+            childrenCollectionRef.get() != null,
+            countAlive(childEntityRefs),
+            childEntityRefs.size(),
+            countAlive(childLoadedStateRefs),
+            childLoadedStateRefs.size(),
+            countAlive(originalChildPayloadRefs),
+            originalChildPayloadRefs.size()
+        );
+    }
+
+    private static int countAlive(List<? extends WeakReference<?>> refs) {
+        int alive = 0;
+        for (WeakReference<?> ref : refs) {
+            if (ref.get() != null) {
+                alive++;
+            }
+        }
+        return alive;
     }
 
     private static void forceGc() throws InterruptedException {
@@ -482,14 +795,71 @@ public final class JpaHibernateMemoryStudy {
         return String.format("%.2f", value);
     }
 
-    private enum Scenario {
+    private enum NoteBoundary {
+        DETACH("detach", "detach"),
+        CLEAR("clear", "clear");
+
+        private final String label;
+        private final String filePrefix;
+
+        NoteBoundary(String label, String filePrefix) {
+            this.label = label;
+            this.filePrefix = filePrefix;
+        }
+
+        String label() {
+            return label;
+        }
+
+        String filePrefix() {
+            return filePrefix;
+        }
+    }
+
+    private enum GraphBoundary {
+        DETACH("detach(entity)", "detach"),
+        CLEAR("clear()", "clear"),
+        CLOSE("session.close()", "close"),
+        COMMIT("transaction.commit()", "commit"),
+        ROLLBACK("transaction.rollback()", "rollback");
+
+        private final String label;
+        private final String fileSlug;
+
+        GraphBoundary(String label, String fileSlug) {
+            this.label = label;
+            this.fileSlug = fileSlug;
+        }
+    }
+
+    private enum GraphScenario {
+        GRAPH_UNINITIALIZED_MULTI("multi-child graph, lazy uninitialized", "graph-uninitialized-multi", false),
+        GRAPH_INITIALIZED_SINGLE("single-child graph, initialized", "graph-initialized-single", true),
+        GRAPH_INITIALIZED_MULTI("multi-child graph, initialized", "graph-initialized-multi", true);
+
+        private final String label;
+        private final String fileSlug;
+        private final boolean initializesChildren;
+
+        GraphScenario(String label, String fileSlug, boolean initializesChildren) {
+            this.label = label;
+            this.fileSlug = fileSlug;
+            this.initializesChildren = initializesChildren;
+        }
+
+        boolean initializesChildren() {
+            return initializesChildren;
+        }
+    }
+
+    private enum TimingScenario {
         MANAGED_HIT("managed-hit"),
         DETACH_THEN_FIND("detach-then-find"),
         CLEAR_THEN_FIND("clear-then-find");
 
         private final String label;
 
-        Scenario(String label) {
+        TimingScenario(String label) {
             this.label = label;
         }
     }
@@ -508,25 +878,15 @@ public final class JpaHibernateMemoryStudy {
         }
     }
 
-    private record RetentionResult(
-        String mode,
-        int managedEntriesBefore,
-        int managedEntriesAfter,
-        int noteIndex,
-        int payloadIndex,
-        String originalNoteMarker,
-        String originalPayloadMarker,
-        String replacementNoteMarker,
-        String replacementPayloadMarker,
-        ReachabilityState afterOperation,
-        ReachabilityState afterSessionClose,
-        PressureObservation pressureObservation,
-        ReachabilityState afterForcedGc
+    private record SeedData(
+        Long noteId,
+        Long singleGraphRootId,
+        Long multiGraphRootId
     ) {
     }
 
-    private record RetentionProbe(
-        String mode,
+    private record NoteRetentionResult(
+        NoteBoundary boundary,
         int managedEntriesBefore,
         int managedEntriesAfter,
         int noteIndex,
@@ -535,19 +895,36 @@ public final class JpaHibernateMemoryStudy {
         String originalPayloadMarker,
         String replacementNoteMarker,
         String replacementPayloadMarker,
-        ReachabilityState afterOperation,
+        NoteReachabilityState afterOperation,
+        NoteReachabilityState afterSessionClose,
+        NotePressureObservation pressureObservation,
+        NoteReachabilityState afterForcedGc
+    ) {
+    }
+
+    private record NoteRetentionProbe(
+        NoteBoundary boundary,
+        int managedEntriesBefore,
+        int managedEntriesAfter,
+        int noteIndex,
+        int payloadIndex,
+        String originalNoteMarker,
+        String originalPayloadMarker,
+        String replacementNoteMarker,
+        String replacementPayloadMarker,
+        NoteReachabilityState afterOperation,
         WeakReference<SecretNote> entityRef,
         WeakReference<Object[]> loadedStateRef,
         WeakReference<String> oldNoteRef,
         WeakReference<byte[]> oldPayloadRef
     ) {
-        RetentionResult toResult(
-            ReachabilityState afterSessionClose,
-            PressureObservation pressureObservation,
-            ReachabilityState afterForcedGc
+        NoteRetentionResult toResult(
+            NoteReachabilityState afterSessionClose,
+            NotePressureObservation pressureObservation,
+            NoteReachabilityState afterForcedGc
         ) {
-            return new RetentionResult(
-                mode,
+            return new NoteRetentionResult(
+                boundary,
                 managedEntriesBefore,
                 managedEntriesAfter,
                 noteIndex,
@@ -564,7 +941,7 @@ public final class JpaHibernateMemoryStudy {
         }
     }
 
-    private record ReachabilityState(
+    private record NoteReachabilityState(
         boolean entityAlive,
         boolean loadedStateAlive,
         boolean oldNoteAlive,
@@ -575,15 +952,117 @@ public final class JpaHibernateMemoryStudy {
         }
     }
 
-    private record PressureObservation(
+    private record NotePressureObservation(
         boolean ran,
         int steps,
         long bytesAllocated,
         double elapsedMillis,
-        ReachabilityState finalState
+        NoteReachabilityState finalState
     ) {
-        static PressureObservation notRun() {
-            return new PressureObservation(false, 0, 0L, 0.0, new ReachabilityState(false, false, false, false));
+        static NotePressureObservation notRun() {
+            return new NotePressureObservation(false, 0, 0L, 0.0, new NoteReachabilityState(false, false, false, false));
+        }
+    }
+
+    private record GraphRetentionResult(
+        GraphScenario scenario,
+        GraphBoundary boundary,
+        int managedEntriesBefore,
+        int managedEntriesAfter,
+        int initializedChildCount,
+        int rootPayloadIndex,
+        int childPayloadIndex,
+        String rootOriginalPayloadMarker,
+        List<String> childOriginalPayloadMarkers,
+        GraphReachabilityState afterOperation,
+        GraphReachabilityState afterSessionClose,
+        GraphPressureObservation pressureObservation,
+        GraphReachabilityState afterForcedGc
+    ) {
+    }
+
+    private record GraphRetentionProbe(
+        GraphScenario scenario,
+        GraphBoundary boundary,
+        String filePrefix,
+        int managedEntriesBefore,
+        int managedEntriesAfter,
+        int initializedChildCount,
+        int rootPayloadIndex,
+        int childPayloadIndex,
+        String rootOriginalPayloadMarker,
+        List<String> childOriginalPayloadMarkers,
+        GraphReachabilityState afterOperation,
+        WeakReference<GraphRoot> rootRef,
+        WeakReference<Object[]> rootLoadedStateRef,
+        WeakReference<byte[]> originalRootPayloadRef,
+        WeakReference<Object> childrenCollectionRef,
+        List<WeakReference<GraphChild>> childEntityRefs,
+        List<WeakReference<Object[]>> childLoadedStateRefs,
+        List<WeakReference<byte[]>> originalChildPayloadRefs
+    ) {
+        GraphRetentionResult toResult(
+            GraphReachabilityState afterSessionClose,
+            GraphPressureObservation pressureObservation,
+            GraphReachabilityState afterForcedGc
+        ) {
+            return new GraphRetentionResult(
+                scenario,
+                boundary,
+                managedEntriesBefore,
+                managedEntriesAfter,
+                initializedChildCount,
+                rootPayloadIndex,
+                childPayloadIndex,
+                rootOriginalPayloadMarker,
+                childOriginalPayloadMarkers,
+                afterOperation,
+                afterSessionClose,
+                pressureObservation,
+                afterForcedGc
+            );
+        }
+    }
+
+    private record GraphReachabilityState(
+        boolean rootEntityAlive,
+        boolean rootLoadedStateAlive,
+        boolean rootOriginalPayloadAlive,
+        boolean childrenCollectionAlive,
+        int childEntitiesAlive,
+        int childEntitiesTracked,
+        int childLoadedStatesAlive,
+        int childLoadedStatesTracked,
+        int childOriginalPayloadsAlive,
+        int childOriginalPayloadsTracked
+    ) {
+        boolean anyAlive() {
+            return rootEntityAlive
+                || rootLoadedStateAlive
+                || rootOriginalPayloadAlive
+                || childrenCollectionAlive
+                || childEntitiesAlive > 0
+                || childLoadedStatesAlive > 0
+                || childOriginalPayloadsAlive > 0;
+        }
+
+        String summary() {
+            return "root=" + flag(rootEntityAlive)
+                + ", collection=" + flag(childrenCollectionAlive)
+                + ", childEntities=" + childEntitiesAlive + "/" + childEntitiesTracked
+                + ", childPayloads=" + childOriginalPayloadsAlive + "/" + childOriginalPayloadsTracked;
+        }
+    }
+
+    private record GraphPressureObservation(
+        boolean ran,
+        int steps,
+        long bytesAllocated,
+        double elapsedMillis,
+        GraphReachabilityState finalState
+    ) {
+        static GraphPressureObservation notRun() {
+            return new GraphPressureObservation(false, 0, 0L, 0.0, new GraphReachabilityState(false, false, false, false, 0, 0, 0, 0, 0, 0));
         }
     }
 
@@ -602,5 +1081,9 @@ public final class JpaHibernateMemoryStudy {
         ScenarioMeasurement detachThenFind,
         ScenarioMeasurement clearThenFind
     ) {
+    }
+
+    private static String flag(boolean value) {
+        return value ? "Y" : "-";
     }
 }

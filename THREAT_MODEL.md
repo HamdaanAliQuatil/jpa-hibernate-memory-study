@@ -5,7 +5,8 @@
 This note explains the security meaning of the two findings from the JPA/Hibernate memory study:
 
 1. `detach()` / `clear()` leave a pre-GC recovery window.
-2. Persistence-context membership is observable through timing.
+2. Initialized object-graph breadth changes how much remains recoverable before GC.
+3. Persistence-context membership is observable through timing.
 
 The goal is to document realistic attacker value without overstating or dismissing the findings.
 
@@ -65,7 +66,70 @@ Balanced assessment:
 - Low significance as a standalone remote exploit concept
 - Strongly relevant for operational assumptions around heap dumps, diagnostics, and "cleanup" logic
 
-## Finding 2: Timing Oracle For Persistence-Context Membership
+## Finding 2: Initialized Graph Breadth Changes Recoverable Surface
+
+### What the finding means
+
+The phase 2 graph matrix compared:
+
+- uninitialized lazy collection
+- initialized single-child graph
+- initialized multi-child graph
+
+across:
+
+- `detach(entity)`
+- `clear()`
+- `session.close()`
+- `transaction.commit()`
+- `transaction.rollback()`
+
+The main result was consistent:
+
+- if the lazy association was not initialized, the child entities and payloads never entered the retained graph in this harness
+- once the association was initialized, the children joined the same pre-GC recovery window as the root entity
+- widening the initialized graph widened the amount of recoverable material
+
+In this controlled setup, boundary choice changed ORM bookkeeping more than it changed reachability. Initialization state was the stronger variable.
+
+### What an attacker would need
+
+This finding has the same access prerequisites as the pre-GC recovery-window result:
+
+1. Same-JVM code execution with object or heap inspection
+- malicious plugin
+- compromised dependency
+- server-side scripting
+- instrumentation agent
+
+2. Pod/container compromise with memory or diagnostics access
+- heap-dump collection
+- process attach surface
+- crash-dump collection
+
+3. Node or host compromise
+
+### What the attacker can gain
+
+- More recoverable data if the application has already traversed a richer object graph
+- Recovery of child entities and their payloads, not only the root entity
+- Better return from heap-dump theft or diagnostic-artifact collection in flows that initialize broad graphs
+
+### What this finding does not mean
+
+- It does not imply that uninitialized lazy associations are a security boundary
+- It does not imply that `commit()` or `close()` are cleanup primitives
+- It does not prove that every Hibernate application retains graphs in the same shape or duration
+
+### Security significance
+
+Balanced assessment:
+
+- Operationally meaningful because it ties memory exposure to application hydration choices
+- Stronger than the single-entity result for real-world data-minimization decisions
+- Still mainly relevant under same-process, pod-compromise, or diagnostic-artifact threat models
+
+## Finding 3: Timing Oracle For Persistence-Context Membership
 
 ### What the finding means
 
@@ -116,16 +180,17 @@ Balanced assessment:
 - Usually not severe as a standalone bug
 - Potentially useful in attack chaining, workflow profiling, session-isolation testing, and same-process adversarial models
 
-## Comparison Of The Two Findings
+## Comparison Of The Findings
 
-The first finding is generally more operationally important if the attacker can compromise pods or collect memory artifacts.
+The first two findings are generally more operationally important than the timing oracle if the attacker can compromise pods or collect memory artifacts.
 
 Reason:
 
 - The pre-GC window directly affects recoverability of data values.
+- The graph-breadth result explains how that recoverability scales once more associations are initialized.
 - The timing oracle mostly reveals access patterns and state, not the values themselves.
 
-The second finding still matters, but mostly for:
+The timing finding still matters, but mostly for:
 
 - in-process adversaries
 - exploit chains
@@ -137,18 +202,22 @@ Good wording:
 
 - "`detach()` / `clear()` are lifecycle operations, not memory sanitization."
 - "Detached objects may remain recoverable until GC actually reclaims them."
+- "Initialized associations can expand how much of the object graph remains recoverable before GC."
 - "Persistence-context membership is locally observable through timing."
 - "These findings are most relevant under same-process, pod-compromise, or diagnostic-artifact threat models."
 
 Avoid:
 
 - calling the first finding "memory wiping bypass"
+- calling initialized lazy loading a security control
 - calling the second finding "data exfiltration" without qualification
+- calling the timing result "data exfiltration" without qualification
 - implying either issue is a strong remote attack on its own
 
 ## Defensive Implications
 
 - Do not treat ORM lifecycle transitions as secure deletion
+- Minimize how much sensitive data a flow hydrates into managed entities and associations
 - Protect heap dumps, crash dumps, and attach/debug surfaces
 - Minimize the lifetime of sensitive objects
 - Keep persistence-context scope tight
